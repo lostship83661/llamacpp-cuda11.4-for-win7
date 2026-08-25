@@ -20,6 +20,9 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+// infer the spec types from the GGUF metadata of a draft model; empty if unknown
+std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
+
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 

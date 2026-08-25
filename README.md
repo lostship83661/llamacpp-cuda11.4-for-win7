@@ -17,7 +17,7 @@ llama.cpp 官方已不再支持 Windows 7，且 CUDA 11.4 的 WDDM 1.1 驱动与
 | **CUDA** | 11.4.4 (WDDM 1.1) |
 | **编译器** | Visual Studio 2019 Build Tools / MSVC v142 |
 | **运行时** | `/MT` 静态链接 CRT |
-| **测试模型** | Qwen3.6-27B Q4_K_M 量化 |
+| **测试模型** | Qwen3.6-27B / Qwen3.8-27B Q4_K_M 量化（架构均为 qwen35） |
 
 **仅测试了上述环境。** 其他 GPU、驱动版本、模型未做测试，可能存在各种 bug。
 
@@ -32,6 +32,9 @@ C:\llama-server\llama-server.exe -m F:\models\model.gguf --host 0.0.0.0 --port 8
 
 # 纯 CPU 推理（不推荐，仅用于调试）
 C:\llama-server\llama-server.exe -m F:\models\model.gguf -ngl 0 --host 0.0.0.0 --port 8080
+
+# 启用 MTP 推测解码加速（Qwen3.5/3.6/3.8 等自带 MTP 头的模型，实测约 2.2 倍）
+C:\llama-server\llama-server.exe -m F:\models\model.gguf --spec-type draft-mtp --spec-draft-n-max 2 --host 0.0.0.0 --port 8080
 
 # 如遇 CUDA VMM 兼容问题，可禁用 VMM
 $env:GGML_CUDA_NO_VMM = '1'
@@ -64,6 +67,11 @@ $env:GGML_CUDA_NO_VMM = '1'
 
 ### 6. 未处理异常捕获
 - `common_init()` 注册 `SetUnhandledExceptionFilter`，崩溃时输出异常码和地址
+
+### 7. 移植 llama.cpp v0.3.0 的推测解码加速
+- **MTP 增强**：新增 `llama_model_params.load_mtp` 按需加载 MTP 头；`qwen35` / `qwen35moe` 支持 `TENSOR_SKIP` 跳过 MTP 张量；`draft-mtp` 支持从 GGUF 元数据自动识别
+- **DSpark 推测解码**：新增 `draft-dspark` 类型，DFlash 骨干 + 半自回归 Markov head + Confidence head；`common_speculative_types_from_gguf` 自动识别 draft 类型
+- **实测**（RTX 2080 Ti 22G，Qwen3.6-27B Q4_K_M）：`--spec-type draft-mtp --spec-draft-n-max 2` 生成约 50 t/s（约 2.2 倍）；单 MTP 头模型的最优 `--spec-draft-n-max` 为 2
 
 ## 编译
 
