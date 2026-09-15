@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# 本仓库自带的 Win7 + CUDA 11.4 构建脚本（上游 .gitignore 忽略了 *.bat，这里显式放行）
+!build_patched.bat
+!configure_patched.bat
