@@ -69,6 +69,7 @@ static std::string llama_format_win_err(DWORD err) {
 struct llama_file::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
+    bool fp_backed = false;
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -95,18 +96,37 @@ struct llama_file::impl {
         std::vector<wchar_t> wfname(wlen);
         MultiByteToWideChar(CP_UTF8, 0, fname, -1, wfname.data(), wlen);
 
-        DWORD dwAccess = GENERIC_READ;
-        DWORD dwShare = FILE_SHARE_READ;
+        // map fopen-style mode to Win32 access/creation flags (mode was previously ignored)
+        DWORD dwAccess = 0;
         DWORD dwCreate = OPEN_EXISTING;
-        DWORD dwFlags = FILE_ATTRIBUTE_NORMAL;
-        if (use_direct_io) {
-            dwFlags |= FILE_FLAG_NO_BUFFERING;
+        bool  append   = false;
+        const char * m = mode;
+        switch (*m++) {
+            case 'r': dwAccess = GENERIC_READ;  dwCreate = OPEN_EXISTING; break;
+            case 'w': dwAccess = GENERIC_WRITE; dwCreate = CREATE_ALWAYS;  break;
+            case 'a': dwAccess = GENERIC_WRITE; dwCreate = OPEN_ALWAYS;    append = true; break;
+            default:  dwAccess = GENERIC_READ;  dwCreate = OPEN_EXISTING; break;
         }
+        for (; *m; ++m) {
+            if (*m == '+') {
+                dwAccess |= GENERIC_READ | GENERIC_WRITE;
+            }
+            // 'b' and 't' flags are ignored on Win32
+        }
+
+        DWORD dwShare = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        DWORD dwFlags = FILE_ATTRIBUTE_NORMAL;
 
         fp_win32 = CreateFileW(wfname.data(), dwAccess, dwShare, NULL, dwCreate, dwFlags, NULL);
         if (fp_win32 == INVALID_HANDLE_VALUE) {
             DWORD err = GetLastError();
             throw std::runtime_error(format("failed to open %s: %s", fname, llama_format_win_err(err).c_str()));
+        }
+
+        if (append) {
+            LARGE_INTEGER liZero;
+            liZero.QuadPart = 0;
+            SetFilePointerEx(fp_win32, liZero, NULL, FILE_END);
         }
 
         // Also open via CRT for fread compatibility
@@ -133,15 +153,23 @@ struct llama_file::impl {
         }
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : owns_fp(false), fp_backed(true) {
         fp = file;
-        fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
+        fp_win32 = INVALID_HANDLE_VALUE;
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);
     }
 
     size_t tell() const {
+        if (fp_backed) {
+            __int64 ret = llama_mmap_ftell(fp);
+            if (ret == -1) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            return (size_t) ret;
+        }
+
         LARGE_INTEGER li;
         li.QuadPart = 0;
         BOOL ret = SetFilePointerEx(fp_win32, li, &li, FILE_CURRENT);
@@ -157,6 +185,13 @@ struct llama_file::impl {
         static_assert(SEEK_CUR == FILE_CURRENT, "SEEK_CUR != FILE_CURRENT");
         static_assert(SEEK_END == FILE_END, "SEEK_END != FILE_END");
 
+        if (fp_backed) {
+            if (llama_mmap_fseek(fp, offset, whence) != 0) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            return;
+        }
+
         LARGE_INTEGER li;
         li.QuadPart = offset;
         BOOL ret = SetFilePointerEx(fp_win32, li, NULL, whence);
@@ -166,6 +201,20 @@ struct llama_file::impl {
     }
 
     void read_raw(void * ptr, size_t len) {
+        if (fp_backed) {
+            if (len == 0) {
+                return;
+            }
+            size_t ret = std::fread(ptr, 1, len, fp);
+            if (std::ferror(fp)) {
+                throw std::runtime_error("read error");
+            }
+            if (ret != len) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+            return;
+        }
+
         size_t bytes_read = 0;
         while (bytes_read < len) {
             size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
@@ -189,6 +238,17 @@ struct llama_file::impl {
     }
 
     void write_raw(const void * ptr, size_t len) const {
+        if (fp_backed) {
+            if (len == 0) {
+                return;
+            }
+            size_t ret = std::fwrite(ptr, 1, len, fp);
+            if (ret != len) {
+                throw std::runtime_error("unexpectedly failed to write bytes");
+            }
+            return;
+        }
+
         size_t bytes_written = 0;
         while (bytes_written < len) {
             size_t chunk_size = std::min<size_t>(len - bytes_written, 64*1024*1024);
@@ -210,7 +270,9 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        // direct I/O (FILE_FLAG_NO_BUFFERING) requires sector-aligned buffers/sizes which
+        // this implementation does not provide, so report it as unavailable on Windows
+        return false;
     }
 
     ~impl() {

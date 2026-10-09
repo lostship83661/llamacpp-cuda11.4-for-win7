@@ -71,6 +71,10 @@ static __global__ void topk_tile(const float * src, float * cand_val, int * cand
     for (int i = 0; i < TILE / BLOCK; ++i) {
         const int col = tile * TILE + threadIdx.x + i * BLOCK;
         uint32_t  b   = col < ncols ? __float_as_uint(row_ptr[col]) : 0;
+        // canonicalize NaN so both signs sort consistently above all finite values
+        if ((b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0u) {
+            b = 0x7FC00000u;
+        }
         b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
         keys[i] = col < ncols ? (((uint64_t) b << 32) | (uint32_t) (ncols - 1 - col)) : 0;
     }
