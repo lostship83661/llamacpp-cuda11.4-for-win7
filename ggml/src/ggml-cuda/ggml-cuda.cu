@@ -1699,7 +1699,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        // accumulate in f32 for real f16 weights: the CUBLAS_COMPUTE_16F path yields
+        // ERR=inf for plain ggml_mul_mat (see test-backend-ops MUL_MAT type_a=f16),
+        // which corrupts f16-weight encoders such as the Qwen3-ASR mmproj
+        prefer_f32_output = src0->type == GGML_TYPE_F16
+            || cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }

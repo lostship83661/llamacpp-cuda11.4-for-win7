@@ -53,7 +53,7 @@ $env:GGML_CUDA_NO_VMM = '1'
 - **修复**：`llama_file::impl` 改用 `CreateFileW` 直接获取 HANDLE，再通过 `_open_osfhandle` + `_fdopen` 转 CRT `FILE*`，全程在 `llama.dll` 自己的 CRT 内完成
 
 ### 3. CUDA 11.4 兼容
-- Compute Capability 7.5 (RTX 2080 Ti)
+- 多显卡架构编译：默认构建 Compute Capability 6.1 / 7.5 / 8.6 三档原生 SASS，详见[多显卡架构编译](#多显卡架构编译推荐)
 - CUDA VMM 驱动层虚拟内存管理：`cuMemAddressReserve` + `cuMemCreate`（每次 ≤3GB）+ `cuMemMap`
 - VMM API 运行期动态解析（`GetProcAddress`），避免静态导入不兼容符号
 - `GGML_CUDA_NO_VMM` 环境变量可运行时禁用 VMM
@@ -85,7 +85,7 @@ $env:GGML_CUDA_NO_VMM = '1'
 
 ```powershell
 cmake -B build -G "Visual Studio 16 2019" -A x64 -T v142 `
-  -DCMAKE_CUDA_ARCHITECTURES=75 `
+  -DCMAKE_CUDA_ARCHITECTURES=61-real;75-real;86-real `
   -DBUILD_SHARED_LIBS=ON `
   -DGGML_CUDA=ON `
   -DGGML_STATIC=OFF `
@@ -94,6 +94,59 @@ cmake -B build -G "Visual Studio 16 2019" -A x64 -T v142 `
 
 cmake --build build --config Release
 ```
+
+### 多显卡架构编译（推荐）
+
+仓库根目录提供三个现成脚本，只构建 `llama-server`，默认产出 **Compute Capability 6.1 / 7.5 / 8.6** 三档原生 SASS：
+
+```powershell
+# 方式一：Ninja 生成器（任何环境都能用，推荐）
+.\build_win7_multiarch_ninja.bat
+
+# 方式二：Visual Studio 生成器（需在普通命令行运行，原因见下）
+.\configure_win7_multiarch.bat
+.\build_win7_multiarch.bat
+```
+
+产物位于 `build-win7-cuda114-ninja\bin\`（方式一）或 `build-win7-cuda114-v142-multiarch\bin\Release\`（方式二）。
+
+**架构选择依据**
+
+| 架构 | 覆盖显卡 |
+|------|----------|
+| `61-real` | GTX 1050 ~ 1080 Ti、Titan Xp、MX150/250（同时覆盖同大版本的 sm_60 / sm_62） |
+| `75-real` | RTX 20xx、GTX 16xx（同时覆盖 sm_72） |
+| `86-real` | RTX 30xx、A10 / A40（同时覆盖 sm_80 / sm_87 / sm_89） |
+
+CUDA 保证同一大版本内**向高小版本**的二进制兼容，因此每档取该大版本的最低小版本即可覆盖整档——例如 sm_86 的 cubin 可以直接跑在 sm_89 上，无需单独编译。CUDA 11.4 最高只能生成 sm_87 的原生代码，**无法为 sm_89 / sm_90 编译原生 SASS**（需要 CUDA 11.8+，而 CUDA 11.5 起已放弃 Win7）。
+
+如需支持其他显卡，编辑脚本中的 `ARCHS` 变量（每增加一个架构，`ggml-cuda.dll` 约增大 75~90 MB）：
+
+- 加 `60-real`：Tesla P40 / P100
+- 加 `70-real`：V100 / Titan V
+- 加 `80-real`：A100 / A30
+- 加 `50-real`：Maxwell（GTX 750 / 9xx，LLM 推理性能较弱）
+- 加 `86-virtual`：让 sm_90 及更新显卡通过驱动 JIT 运行（Win7 无对应驱动，一般不需要）
+
+> **注意**：不要只加一个较低的 `XX-virtual` 当兜底。ggml-cuda 依据 `__CUDA_ARCH_LIST__`（包含 virtual 项）决定启用哪些 kernel，若只放 `50-virtual`，宿主会按 Pascal/Turing 特性选择 kernel，而驱动实际 JIT 的是 compute_50 代码，两者不一致。要加就整档加。
+
+**为什么另外提供 Ninja 脚本**
+
+CUDA 11.4 的 MSBuild 集成通过 XAML 任务工厂定义 `CudaCompile` 任务，该任务工厂在低完整性（Low IL）令牌下无法创建，会报 `MSB4175 ... 客户端没有所需的特权`。Ninja 生成器由 CMake 直接调用 `nvcc`，不经过 MSBuild，因此在受限环境下同样可用；在普通命令行中两种方式都可以。
+
+**部署（只用 llama-server）**
+
+`llama-server` 不依赖其他工具 exe，运行时需要同一构建目录产出的以下 9 个文件（1 个 exe + 8 个 DLL）：
+
+```
+llama-server.exe
+ggml-base.dll   ggml-cpu.dll   ggml-cuda.dll   ggml.dll
+llama.dll       llama-common.dll   llama-server-impl.dll   mtmd.dll
+```
+
+构建目录里同名的 `.manifest` 文件是链接器副产品，manifest 已嵌入 PE，**无需部署**。
+
+必须**整套替换**，不要只替换 `ggml-cuda.dll`：各 DLL 之间存在 ABI 依赖。
 
 ## 已修复的 Bug
 
@@ -104,11 +157,13 @@ cmake --build build --config Release
 | 3 | VMM 初始化失败 | `cuMem*` API 静态导入在老旧驱动上不存在 | 运行期动态解析 + `GGML_CUDA_NO_VMM` 开关 |
 | 4 | Win7 上 `GetFileInformationByHandleEx` 导入失败 | `std::filesystem` 间接引入 Win8+ API | Win32 API 替代 |
 | 5 | cpp-httplib `WSAPoll` 在 Win7 上不可用 | HTTP 库使用了 Win8+ 网络 API | `select()` 回退 |
+| 6 | 多模态模型（如 Qwen3-ASR）无法识别音频，只输出 `language None<asr_text>` | cuBLAS 对 f16 权重使用 `CUBLAS_COMPUTE_16F`（fp16 累加），本工具链下普通 `ggml_mul_mat` 产出 `inf`；而 mmproj 的卷积 / `conv_out` 权重正是 f16，导致音频嵌入变成垃圾。量化权重走另一条路径，所以纯文本推理看起来正常 | `ggml-cuda.cu`：当 `src0->type == GGML_TYPE_F16` 时改走既有 `prefer_f32_output` 分支，用 f32 累加。量化权重不受影响，LLM 推理速度不变。修复后 `test-backend-ops` 的 CUDA 失败数由 201 降到 4（剩余为 `iq1_m`，另一独立问题） |
 
 ## 免责声明
 
 - 本项目仅在自己的测试环境（Win7 x64 + 2080 Ti 22GB + CUDA 11.4）验证通过
 - **未在其他 GPU、驱动版本、模型上测试**
+- 多架构构建中的 sm_61 / sm_86 等架构仅验证了**编译产物正确包含对应 cubin**，未在对应显卡上做过运行时验证
 - 可能存在未发现的兼容性问题，生产环境使用请自行评估风险
 - 欢迎提交 Issue 反馈其他环境下的问题
 
