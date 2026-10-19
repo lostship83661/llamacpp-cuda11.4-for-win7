@@ -526,6 +526,316 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
+// Weight side of a q4_K vec_dot with the nibble extraction and the 6-bit scale/min
+// unpacking already done. It only depends on the weights, so when several activation
+// columns are verified in one step (speculative decoding) it is built once per row and
+// reused for every column instead of being recomputed for each of them.
+struct q4_K_mmvq_w {
+    int vi0[QR4_K];
+    int vi1[QR4_K];
+    int sc[QR4_K];
+    int mn[QR4_K];
+    float2 dm;
+};
+
+static __device__ __forceinline__ q4_K_mmvq_w q4_K_mmvq_load_w(
+        const void * __restrict__ vbq, const int & kbx, const int & iqs) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    q4_K_mmvq_w w;
+
+    // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        w.vi0[i] = (v0 >> (4*i)) & 0x0F0F0F0F;
+        w.vi1[i] = (v1 >> (4*i)) & 0x0F0F0F0F;
+    }
+
+    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        w.sc[i] = sc[i];
+        w.mn[i] = m[i];
+    }
+
+    w.dm = __half22float2(bq4_K->dm);
+
+    return w;
+}
+
+static __device__ __forceinline__ float q4_K_mmvq_dot(
+        const q4_K_mmvq_w & w, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+
+    int   u[2*QR4_K];
+    float d8[QR4_K];
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int dot1 = ggml_cuda_dp4a(w.vi1[i], u[2*i+1], ggml_cuda_dp4a(w.vi0[i], u[2*i+0], 0));
+        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
+
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.mn[i]);
+    }
+
+    return w.dm.x*sumf_d - w.dm.y*sumf_m;
+}
+
+// Same idea as q4_K_mmvq_w for the other quantization types used by typical
+// Q4_K_M/IQ4_XS style files: everything that only depends on the weights is
+// computed once per row instead of once per activation column.
+struct q5_K_mmvq_w {
+    int v0[QR5_K];
+    int v1[QR5_K];
+    int sc[QR5_K];
+    int mn[QR5_K];
+    float2 dm;
+};
+
+static __device__ __forceinline__ q5_K_mmvq_w q5_K_mmvq_load_w(
+        const void * __restrict__ vbq, const int & kbx, const int & iqs) {
+
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
+
+    q5_K_mmvq_w w;
+
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+
+    const int vl0 = ql[0];
+    const int vl1 = ql[4];
+
+    const int vh0 = qh[0] >> bq8_offset;
+    const int vh1 = qh[4] >> bq8_offset;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const int vl0i = (vl0 >> (4*i)) & 0x0F0F0F0F;
+        const int vl1i = (vl1 >> (4*i)) & 0x0F0F0F0F;
+
+        const int vh0i = ((vh0 >> i) << 4) & 0x10101010;
+        const int vh1i = ((vh1 >> i) << 4) & 0x10101010;
+
+        w.v0[i] = vl0i | vh0i;
+        w.v1[i] = vl1i | vh1i;
+    }
+
+    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        w.sc[i] = sc[i];
+        w.mn[i] = m[i];
+    }
+
+    w.dm = __half22float2(bq5_K->dm);
+
+    return w;
+}
+
+static __device__ __forceinline__ float q5_K_mmvq_dot(
+        const q5_K_mmvq_w & w, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+
+    int   u[2*QR5_K];
+    float d8[QR5_K];
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+        const int dot1 = ggml_cuda_dp4a(w.v0[i], u[2*i+0], ggml_cuda_dp4a(w.v1[i], u[2*i+1], 0));
+        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0));
+
+        sumf_d += d8[i] * (dot1 * w.sc[i]);
+        sumf_m += d8[i] * (dot2 * w.mn[i]);
+    }
+
+    return w.dm.x*sumf_d - w.dm.y*sumf_m;
+}
+
+struct q6_K_mmvq_w {
+    int v[QR6_K];
+    int sc[QR6_K];
+    float d;
+};
+
+static __device__ __forceinline__ q6_K_mmvq_w q6_K_mmvq_load_w(
+        const void * __restrict__ vbq, const int & kbx, const int & iqs) {
+
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    q6_K_mmvq_w w;
+
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+
+        w.v[i]  = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        w.sc[i] = scales[4*i];
+    }
+
+    w.d = __half2float(bq6_K->d);
+
+    return w;
+}
+
+static __device__ __forceinline__ float q6_K_mmvq_dot(
+        const q6_K_mmvq_w & w, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+
+    int   u[QR6_K];
+    float d8[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + 2*i;
+        d8[i] = __low2float(bq8i->ds);
+        u[i]  = get_int_b4(bq8i->qs, iqs % QI8_1);
+    }
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        sumf += d8[i] * (ggml_cuda_dp4a(w.v[i], u[i], 0) * w.sc[i]);
+    }
+
+    return w.d*sumf;
+}
+
+struct iq4_xs_mmvq_w {
+    int vx[4];
+    int vy[4];
+    int ls;
+    float d;
+};
+
+static __device__ __forceinline__ iq4_xs_mmvq_w iq4_xs_mmvq_load_w(
+        const void * __restrict__ vbq, const int & kbx, const int & iqs) {
+
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+
+    iq4_xs_mmvq_w w;
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+        w.vx[j] = v.x;
+        w.vy[j] = v.y;
+    }
+
+    w.ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    w.d  = __half2float(bq4->d);
+
+    return w;
+}
+
+// Activation side of the iq4_XS dot product, hoisted out of the row loop.
+struct iq4_xs_mmvq_y {
+    int u[8];
+    float d8;
+};
+
+static __device__ __forceinline__ iq4_xs_mmvq_y iq4_xs_mmvq_load_y(
+        const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    iq4_xs_mmvq_y y;
+
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        y.u[m] = get_int_b4(bq8_1[iqs/4].qs, m);
+    }
+    y.d8 = __low2float(bq8_1[iqs/4].ds);
+
+    return y;
+}
+
+static __device__ __forceinline__ float iq4_xs_mmvq_dot_y(
+        const iq4_xs_mmvq_w & w, const iq4_xs_mmvq_y & y) {
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        sumi = ggml_cuda_dp4a(w.vx[j], y.u[j + 0], sumi);
+        sumi = ggml_cuda_dp4a(w.vy[j], y.u[j + 4], sumi);
+    }
+
+    sumi *= w.ls - 32;
+
+    return (w.d * y.d8) * sumi;
+}
+
 // contiguous v/x + u/y values
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,

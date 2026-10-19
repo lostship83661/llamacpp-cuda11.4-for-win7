@@ -499,6 +499,14 @@ static __global__ void mul_mat_vec_q(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
+    // With more than one activation column (e.g. verifying several speculative draft
+    // tokens) the weight-side dequantization used to be redone for every column.
+    // For the types below it is hoisted out of the column loop instead.
+    constexpr bool use_hoisted_w =
+        !has_fusion && ncols_dst > 1 &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+         type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS);
+
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
@@ -595,16 +603,63 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
+        if constexpr (use_hoisted_w) {
+            // The weight-side dequantization of a block is done once and shared by all
+            // activation columns instead of being redone for each column.
+            if constexpr (type == GGML_TYPE_IQ4_XS) {
+                // iq4_XS walks 4 q8_1 blocks per weight block (vdr == 4), so the activation
+                // side is worth hoisting across rows as well.
+                iq4_xs_mmvq_w ws[rows_per_cuda_block];
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    ws[i] = iq4_xs_mmvq_load_w(vx, kbx_offset + i*stride_row_x + kbx, kqs);
+                }
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const iq4_xs_mmvq_y yy = iq4_xs_mmvq_load_y(&y[j*stride_col_y + kby], kqs);
+#pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp[j][i] += iq4_xs_mmvq_dot_y(ws[i], yy);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const int ibx = kbx_offset + i*stride_row_x + kbx;
+                    if constexpr (type == GGML_TYPE_Q4_K) {
+                        const q4_K_mmvq_w w = q4_K_mmvq_load_w(vx, ibx, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp[j][i] += q4_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
+                        }
+                    } else if constexpr (type == GGML_TYPE_Q5_K) {
+                        const q5_K_mmvq_w w = q5_K_mmvq_load_w(vx, ibx, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp[j][i] += q5_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
+                        }
+                    } else {
+                        static_assert(type == GGML_TYPE_Q6_K, "unexpected type");
+                        const q6_K_mmvq_w w = q6_K_mmvq_load_w(vx, ibx, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp[j][i] += q6_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
+                        }
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
