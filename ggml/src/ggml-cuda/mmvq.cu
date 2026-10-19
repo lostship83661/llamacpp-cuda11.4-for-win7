@@ -501,11 +501,12 @@ static __global__ void mul_mat_vec_q(
 
     // With more than one activation column (e.g. verifying several speculative draft
     // tokens) the weight-side dequantization used to be redone for every column.
-    // For the types below it is hoisted out of the column loop instead.
+    // For q4_K and q5_K, whose weight side consists of the nibble extraction and the
+    // unpacking of the 6 bit scales/minimums, it is hoisted out of the column loop.
+    // Types with a cheap weight side (q6_K) or a wide vdr (iq4_XS) do not profit from
+    // this and keep the previous code path.
     constexpr bool use_hoisted_w =
-        !has_fusion && ncols_dst > 1 &&
-        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-         type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS);
+        !has_fusion && ncols_dst > 1 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -606,45 +607,21 @@ static __global__ void mul_mat_vec_q(
         if constexpr (use_hoisted_w) {
             // The weight-side dequantization of a block is done once and shared by all
             // activation columns instead of being redone for each column.
-            if constexpr (type == GGML_TYPE_IQ4_XS) {
-                // iq4_XS walks 4 q8_1 blocks per weight block (vdr == 4), so the activation
-                // side is worth hoisting across rows as well.
-                iq4_xs_mmvq_w ws[rows_per_cuda_block];
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    ws[i] = iq4_xs_mmvq_load_w(vx, kbx_offset + i*stride_row_x + kbx, kqs);
-                }
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int ibx = kbx_offset + i*stride_row_x + kbx;
+                if constexpr (type == GGML_TYPE_Q4_K) {
+                    const q4_K_mmvq_w w = q4_K_mmvq_load_w(vx, ibx, kqs);
 #pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    const iq4_xs_mmvq_y yy = iq4_xs_mmvq_load_y(&y[j*stride_col_y + kby], kqs);
-#pragma unroll
-                    for (int i = 0; i < rows_per_cuda_block; ++i) {
-                        tmp[j][i] += iq4_xs_mmvq_dot_y(ws[i], yy);
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        tmp[j][i] += q4_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
                     }
-                }
-            } else {
+                } else {
+                    static_assert(type == GGML_TYPE_Q5_K, "unexpected type");
+                    const q5_K_mmvq_w w = q5_K_mmvq_load_w(vx, ibx, kqs);
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const int ibx = kbx_offset + i*stride_row_x + kbx;
-                    if constexpr (type == GGML_TYPE_Q4_K) {
-                        const q4_K_mmvq_w w = q4_K_mmvq_load_w(vx, ibx, kqs);
-#pragma unroll
-                        for (int j = 0; j < ncols_dst; ++j) {
-                            tmp[j][i] += q4_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
-                        }
-                    } else if constexpr (type == GGML_TYPE_Q5_K) {
-                        const q5_K_mmvq_w w = q5_K_mmvq_load_w(vx, ibx, kqs);
-#pragma unroll
-                        for (int j = 0; j < ncols_dst; ++j) {
-                            tmp[j][i] += q5_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
-                        }
-                    } else {
-                        static_assert(type == GGML_TYPE_Q6_K, "unexpected type");
-                        const q6_K_mmvq_w w = q6_K_mmvq_load_w(vx, ibx, kqs);
-#pragma unroll
-                        for (int j = 0; j < ncols_dst; ++j) {
-                            tmp[j][i] += q6_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
-                        }
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        tmp[j][i] += q5_K_mmvq_dot(w, &y[j*stride_col_y + kby], kqs);
                     }
                 }
             }
