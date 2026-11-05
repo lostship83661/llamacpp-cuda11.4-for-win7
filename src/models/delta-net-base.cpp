@@ -474,52 +474,58 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 
-    const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+    const size_t cell_size = conv_states_all->nb[1];
+    const size_t cell_offs = kv_head * cell_size;
+
+    // number of tokens in this ubatch
+    const int64_t n = conv_input->ne[0] - (conv_kernel_size - 1);
 
     if (cparams.n_rs_seq == 0) {
-        const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
-        const int64_t s_slot = 0;
-
         ggml_tensor * conv_state_last =
             ggml_view_3d(ctx0, conv_input,
                     conv_kernel_size - 1, conv_channels, n_seqs,
                     conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+                    ggml_row_size(conv_input->type, n));
         cb(conv_state_last, "conv_state_last", il);
 
         ggml_tensor * conv_state_update =
             ggml_view_2d(ctx0, conv_states_all,
-                    row_count, n_seqs, conv_states_all->nb[1],
-                    (s_slot * mem_size + kv_head) * row_size);
+                    row_count, n_seqs, cell_size, cell_offs);
         cb(conv_state_update, "conv_state_update", il);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
-    } else {
-        // [TAG_RECURRENT_ROLLBACK_SPLITS]
-        // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
-        //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
-
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
-
-            ggml_tensor * conv_state_last =
-                ggml_view_3d(ctx0, conv_input,
-                        conv_kernel_size - 1, conv_channels, n_seqs,
-                        conv_input->nb[1], conv_input->nb[2],
-                        ggml_row_size(conv_input->type, s_idx));
-
-            ggml_tensor * conv_state_update =
-                ggml_view_2d(ctx0,
-                        conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
-
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
-        }
+        return conv_input;
     }
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+    // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+    //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
+    // a rollback of k tokens reads slot k, and the memory allows k < n only, so slots from n on are left unwritten
+    const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t Kw = std::min(n, K);
+
+    ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);
+    s_slot_rev = ggml_scale_bias(ctx0, s_slot_rev, -1.0f, (float) (K - 1));
+    s_slot_rev = ggml_cast(ctx0, s_slot_rev, GGML_TYPE_I32);
+    cb(s_slot_rev, "s_slot_rev", il);
+
+    ggml_tensor * slot_order = ggml_view_1d(ctx0, s_slot_rev, Kw, ggml_row_size(GGML_TYPE_I32, K - Kw));
+
+    // window w starts at column n - (Kw - 1) + w (ascending time) and is rollback slot Kw - 1 - w,
+    // consecutive windows start one element apart, so they overlap
+    ggml_tensor * windows = ggml_view_4d(ctx0, conv_input,
+            conv_kernel_size - 1, Kw, conv_channels, n_seqs,
+            ggml_element_size(conv_input), conv_input->nb[1], conv_input->nb[2],
+            ggml_row_size(conv_input->type, n - (Kw - 1)));
+
+    // [n_cols, slot, channel, seq] view of the cells of this ubatch
+    ggml_tensor * slots = ggml_view_4d(ctx0, conv_states_all,
+            conv_kernel_size - 1, K, conv_channels, n_seqs,
+            (size_t) mem_size * cell_size, ggml_row_size(conv_states_all->type, conv_kernel_size - 1), cell_size,
+            cell_offs);
+
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, windows, slot_order));
 
     return conv_input;
 }
