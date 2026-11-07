@@ -35,6 +35,7 @@
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+    #include <fcntl.h>
 #endif
 
 #if defined(__APPLE__)
@@ -96,20 +97,22 @@ struct llama_file::impl {
         std::vector<wchar_t> wfname(wlen);
         MultiByteToWideChar(CP_UTF8, 0, fname, -1, wfname.data(), wlen);
 
-        // map fopen-style mode to Win32 access/creation flags (mode was previously ignored)
+        // map fopen-style mode to Win32 access/creation flags and matching CRT flags
         DWORD dwAccess = 0;
         DWORD dwCreate = OPEN_EXISTING;
+        int   crtFlags = _O_RDONLY;
         bool  append   = false;
         const char * m = mode;
         switch (*m++) {
-            case 'r': dwAccess = GENERIC_READ;  dwCreate = OPEN_EXISTING; break;
-            case 'w': dwAccess = GENERIC_WRITE; dwCreate = CREATE_ALWAYS;  break;
-            case 'a': dwAccess = GENERIC_WRITE; dwCreate = OPEN_ALWAYS;    append = true; break;
-            default:  dwAccess = GENERIC_READ;  dwCreate = OPEN_EXISTING; break;
+            case 'r': dwAccess = GENERIC_READ;            dwCreate = OPEN_EXISTING; crtFlags = _O_RDONLY; break;
+            case 'w': dwAccess = GENERIC_WRITE;           dwCreate = CREATE_ALWAYS;  crtFlags = _O_WRONLY; break;
+            case 'a': dwAccess = GENERIC_WRITE;           dwCreate = OPEN_ALWAYS;    crtFlags = _O_WRONLY | _O_APPEND; append = true; break;
+            default:  dwAccess = GENERIC_READ;            dwCreate = OPEN_EXISTING; crtFlags = _O_RDONLY; break;
         }
         for (; *m; ++m) {
             if (*m == '+') {
                 dwAccess |= GENERIC_READ | GENERIC_WRITE;
+                crtFlags  = (crtFlags & _O_APPEND) | _O_RDWR;
             }
             // 'b' and 't' flags are ignored on Win32
         }
@@ -129,16 +132,16 @@ struct llama_file::impl {
             SetFilePointerEx(fp_win32, liZero, NULL, FILE_END);
         }
 
-        // Also open via CRT for fread compatibility
-        int fd = _open_osfhandle((intptr_t)fp_win32, 0);
+        // Also open via CRT for fread/fwrite compatibility
+        int fd = _open_osfhandle((intptr_t)fp_win32, crtFlags);
         if (fd == -1) {
             CloseHandle(fp_win32);
             throw std::runtime_error(format("failed to _open_osfhandle for %s", fname));
         }
         fp = _fdopen(fd, mode);
         if (fp == NULL) {
+            // _open_osfhandle took ownership of the HANDLE: closing fd closes it too
             _close(fd);
-            CloseHandle(fp_win32);
             throw std::runtime_error(format("failed to _fdopen for %s", fname));
         }
 

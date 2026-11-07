@@ -57,6 +57,28 @@ static int next_power_of_2(int x) {
 #define TOPK_TILE_WIDE 8192
 #define TOPK_TILE      4096
 
+bool ggml_cuda_top_k_supported(const ggml_tensor * op) {
+#ifdef CUB_TOP_K_AVAILABLE
+    GGML_UNUSED(op);
+    return true;
+#else
+    if (!ggml_is_contiguous(op->src[0])) {
+        return false;
+    }
+
+    const int ncols = (int) op->src[0]->ne[0];
+    const int k     = (int) op->ne[0];
+    if (ncols <= TOPK_CAND) {
+        return true;
+    }
+
+    // wide rows go through the tiled path, which must shrink to TOPK_CAND candidates
+    const int tile   = ncols >= 65536 ? TOPK_TILE_WIDE : TOPK_TILE;
+    const int ntiles = (ncols + tile - 1) / tile;
+    return ntiles * k <= TOPK_CAND;
+#endif
+}
+
 template <int TILE, int BLOCK>
 static __global__ void topk_tile(const float * src, float * cand_val, int * cand_idx,
                                  const int ncols, const int ntiles, const int k) {
