@@ -1198,6 +1198,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // the DFlash2 selector and the DSpark head fold the batch into
+        // [tokens_per_block, n_seqs], so all blocks in this batch must be equally large.
+        // the slots ask for different maxima when their remaining context differs, so use
+        // the smallest one for the whole batch instead of aborting on a ragged block.
+        int32_t n_draft_batch = params.n_max;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            n_draft_batch = std::min(n_draft_batch, dp.n_max > 0 ? dp.n_max : params.n_max);
+        }
+        if (n_draft_batch <= 0) {
+            return;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1208,12 +1225,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            int32_t n_draft = params.n_max;
-            if (dp.n_max > 0) {
-                n_draft = std::min(n_draft, dp.n_max);
-            }
-
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+            const int32_t n_block_tokens = n_draft_batch + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {

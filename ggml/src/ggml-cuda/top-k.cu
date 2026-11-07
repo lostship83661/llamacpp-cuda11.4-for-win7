@@ -58,14 +58,14 @@ static int next_power_of_2(int x) {
 #define TOPK_TILE      4096
 
 bool ggml_cuda_top_k_supported(const ggml_tensor * op) {
-#ifdef CUB_TOP_K_AVAILABLE
-    GGML_UNUSED(op);
-    return true;
-#else
-    if (!ggml_is_contiguous(op->src[0])) {
+    if (op->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[0])) {
         return false;
     }
 
+#ifdef GGML_CUDA_USE_CUB
+    // both CUB paths (direct top-k and argsort) handle any row width
+    return true;
+#else
     const int ncols = (int) op->src[0]->ne[0];
     const int k     = (int) op->ne[0];
     if (ncols <= TOPK_CAND) {
