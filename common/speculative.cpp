@@ -2332,51 +2332,6 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
     }
 }
 
-std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
-    struct gguf_init_params gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ nullptr,
-    };
-
-    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
-    if (!gguf_ctx) {
-        return {};
-    }
-
-    const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
-    if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
-        return {};
-    }
-
-    const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
-    if (arch != "dflash") {
-        const int64_t block_count_id = gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str());
-        if (block_count_id < 0 || gguf_get_kv_type(gguf_ctx.get(), block_count_id) != GGUF_TYPE_UINT32) {
-            return {};
-        }
-
-        const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), block_count_id);
-        if (block_count == 0) {
-            return {};
-        }
-
-        if (gguf_find_tensor(gguf_ctx.get(), ("blk." + std::to_string(block_count - 1) + ".nextn.eh_proj.weight").c_str()) >= 0) {
-            return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-        }
-
-        return {};
-    }
-
-    // the Markov head distinguishes draft-dspark from draft-dflash
-    const auto type = gguf_find_tensor(gguf_ctx.get(), "markov_w1.weight") >= 0
-                    ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
-                    : COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
-
-    SPC_INF("auto-detected speculative type '%s' from the draft model metadata\n", common_speculative_type_to_str(type).c_str());
-
-    return { type };
-}
-
 std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {
     std::vector<common_speculative_type> types;
     types.reserve(names.size());

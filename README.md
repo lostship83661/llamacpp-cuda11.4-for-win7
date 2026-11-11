@@ -69,8 +69,8 @@ $env:GGML_CUDA_NO_VMM = '1'
 - `common_init()` 注册 `SetUnhandledExceptionFilter`，崩溃时输出异常码和地址
 
 ### 7. 移植 llama.cpp v0.3.0 的推测解码加速
-- **MTP 增强**：新增 `llama_model_params.load_mtp` 按需加载 MTP 头；`qwen35` / `qwen35moe` 支持 `TENSOR_SKIP` 跳过 MTP 张量；`draft-mtp` 支持从 GGUF 元数据自动识别
-- **DSpark 推测解码**：新增 `draft-dspark` 类型，DFlash 骨干 + 半自回归 Markov head + Confidence head；`common_speculative_types_from_gguf` 自动识别 draft 类型
+- **MTP 增强**：新增 `llama_model_params.load_mtp` 按需加载 MTP 头；`qwen35` / `qwen35moe` 支持 `TENSOR_SKIP` 跳过 MTP 张量；启用 `--spec-type draft-mtp` 时按需加载 MTP 层
+- **DSpark 推测解码**：新增 `draft-dspark` 类型，DFlash 骨干 + 半自回归 Markov head + Confidence head；通过 `--spec-type draft-dspark` 显式启用
 - **实测**（RTX 2080 Ti 22G，Qwen3.6-27B Q4_K_M）：`--spec-type draft-mtp --spec-draft-n-max 2` 生成约 50 t/s（约 2.2 倍）；单 MTP 头模型的最优 `--spec-draft-n-max` 为 2
 
 ## 编译
