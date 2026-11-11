@@ -1683,7 +1683,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // Only load the MTP layers when the target model is the one that drafts. With a
+    // separate draft model (-md) the drafting runs in ctx_dft (see speculative.cpp),
+    // the target only has to emit h_nextn, which comes from output_norm - so its MTP
+    // tensors would sit in VRAM unused. The draft model gets the flag forced back on
+    // in common_speculative_init_result.
+    mparams.load_mtp                    = !params.speculative.has_dft() &&
+        std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }

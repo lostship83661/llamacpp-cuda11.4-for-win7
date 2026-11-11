@@ -2451,6 +2451,10 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // this context is the one that runs the nextn layers, so it must load them even
+    // when the target was told to skip its own MTP head because of -md
+    mparams.load_mtp = spec_mtp;
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
