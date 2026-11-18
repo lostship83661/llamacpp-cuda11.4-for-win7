@@ -8,16 +8,24 @@
 
 llama.cpp 官方已不再支持 Windows 7，且 CUDA 11.4 的 WDDM 1.1 驱动与新版 CUDA Toolkit 存在兼容性问题。本项目针对这些限制做了大量适配，使其能在老旧系统上正常运行。
 
+源码基线约为上游 2026-10-09 的 master（b11527 前后），本仓库在其上共 15 个提交（含文档整理）。需要说明的是：**追平上游并不会更快**。用同一套工具链编译上游最新 master（b12155）做锁频对比，在本卡上 MTP 模式反而慢约 12%，而本仓库的 MMVQ Turing 补丁是上游没有的。
+
 ## 测试环境
 
 | 项目 | 详情 |
 |------|------|
-| **硬件** | NVIDIA RTX 2080 Ti（**魔改 22GB 显存**） |
-| **系统** | Windows 7 x64 SP1 |
-| **CUDA** | 11.4.4 (WDDM 1.1) |
+| **GPU** | NVIDIA RTX 2080 Ti（**魔改 22GB 显存**，sm_75，标称带宽 616 GB/s） |
+| **系统** | Windows 7 x64 SP1，驱动 475.xx |
+| **CUDA** | 11.4.4（WDDM 1.1） |
 | **编译器** | Visual Studio 2019 Build Tools / MSVC v142 |
 | **运行时** | `/MT` 静态链接 CRT |
-| **测试模型** | Qwen3.6-27B / Qwen3.8-27B Q4_K_M 量化（架构均为 qwen35） |
+| **测试模型** | `Qwen3.8-27B-UD-Q4_K_M.gguf`（15.33 GB，架构 qwen35）+ `FastMTP-32K` 草稿模块（0.84 GB）+ `mmproj-Q8_0` |
+
+涉及三台机器，性能读数均在 Win7 上取得：
+
+- **开发机**：i5-14400F / 32 GB / 2080 Ti 22G / Win10（双启 Win7）
+- **生产机**：E5-2666 v3 / X99 / DDR3 ECC 32 GB / 同款卡 / Win7 / 装有云桌面客户端
+- **对照机**：E5-2678 v3 / X99 / 64 GB / 同款卡 / Win7
 
 **仅测试了上述环境。** 其他 GPU、驱动版本、模型未做测试，可能存在各种 bug。
 
@@ -33,12 +41,46 @@ C:\llama-server\llama-server.exe -m F:\models\model.gguf --host 0.0.0.0 --port 8
 # 纯 CPU 推理（不推荐，仅用于调试）
 C:\llama-server\llama-server.exe -m F:\models\model.gguf -ngl 0 --host 0.0.0.0 --port 8080
 
-# 启用 MTP 推测解码加速（Qwen3.5/3.6/3.8 等自带 MTP 头的模型，实测约 2.2 倍）
+# 启用 MTP 推测解码加速（Qwen3.5/3.6/3.8 等自带 MTP 头的模型）
 C:\llama-server\llama-server.exe -m F:\models\model.gguf --spec-type draft-mtp --spec-draft-n-max 2 --host 0.0.0.0 --port 8080
 
 # 如遇 CUDA VMM 兼容问题，可禁用 VMM
 $env:GGML_CUDA_NO_VMM = '1'
 ```
+
+### 22GB 卡的实测推荐配置
+
+这是目前在 2080 Ti 22G + Qwen3.8-27B Q4_K_M 上跑下来的最优组合，逐条都有实测依据（见[性能实测](#性能实测)）：
+
+```powershell
+llama-server.exe `
+    -m  C:\models\Qwen3.8\Qwen3.8-27B-UD-Q4_K_M.gguf `
+    -md C:\models\Qwen3.8\Qwen3.8-27B-FastMTP-32K.gguf `
+    --host 127.0.0.1 --port 8080 `
+    --ctx-size 16384 `
+    -ngl 99 `
+    --flash-attn on `
+    --spec-type draft-mtp,ngram-mod `
+    --spec-draft-n-max 2 `
+    --parallel 1 `
+    --batch-size 2048 --ubatch-size 512 `
+    --threads 8 --threads-batch 10 `
+    --no-mmap `
+    --jinja
+```
+
+按用途微调：
+
+| 场景 | 改法 | 依据 |
+|------|------|------|
+| 纯聊天、大量非重复散文 | `--spec-type draft-mtp`（去掉 ngram） | ngram 对散文无收益，徒增提案开销 |
+| 输出高度重复（改代码、填表、模板） | `--spec-type draft-mtp,ngram-simple` | 代码更快，但散文慢约 2% |
+| 上下文 > 32k、显存吃紧 | 加 `--cache-type-k q8_0 --cache-type-v q8_0` | 16k 以内 f16 KV 更快，超过才值得换 q8_0 |
+| 显存装不下目标模型 | 换 IQ4_XS 量化 | 省约 2.1 GiB，解码只慢约 1% |
+
+`--spec-draft-n-max` 对单 MTP 头模型的最优值是 **2**；叠加 ngram 后 `n=3` 反而更差。
+
+> 推测解码是**验证式**的：输出与不开投机逐字节一致，加速不牺牲质量。
 
 ## 主要改动
 
@@ -68,10 +110,90 @@ $env:GGML_CUDA_NO_VMM = '1'
 ### 6. 未处理异常捕获
 - `common_init()` 注册 `SetUnhandledExceptionFilter`，崩溃时输出异常码和地址
 
-### 7. 移植 llama.cpp v0.3.0 的推测解码加速
+### 7. 推测解码（MTP / DSpark / FastMTP）
 - **MTP 增强**：新增 `llama_model_params.load_mtp` 按需加载 MTP 头；`qwen35` / `qwen35moe` 支持 `TENSOR_SKIP` 跳过 MTP 张量；启用 `--spec-type draft-mtp` 时按需加载 MTP 层
 - **DSpark 推测解码**：新增 `draft-dspark` 类型，DFlash 骨干 + 半自回归 Markov head + Confidence head；通过 `--spec-type draft-dspark` 显式启用
-- **实测**（RTX 2080 Ti 22G，Qwen3.6-27B Q4_K_M）：`--spec-type draft-mtp --spec-draft-n-max 2` 生成约 50 t/s（约 2.2 倍）；单 MTP 头模型的最优 `--spec-draft-n-max` 为 2
+- **FastMTP 草稿模块**：`qwen35` 支持 GGUF 里的 `d2t` 张量做 draft-vocab trim——草稿头只在小词表上出 logits，再映射回全词表（`src/models/qwen35.cpp`）。配套的 `HauhauCS-FastMTP-llama.cpp.patch` 保留在仓库根目录，供同步上游后重新套用
+- **省显存**：给了 `-md` 草稿模型时不再加载目标模型的 MTP 头。drafting 全在 `ctx_dft` 里跑，目标的 nextn 层根本不会执行，之前白占约 330 MiB 常驻显存（`21397 -> 21069 MiB`，输出与速度不变）
+
+### 8. MMVQ 量化解码提速（Turing 专项，上游没有）
+投机解码一步要验证多列激活，而 MMVQ kernel 原本每列都把**权重侧**重算一遍（nibble 提取 + 6-bit scale/min 解包），这部分其实与列无关。
+
+- **权重反量化外提**：改成每行算一次、各列共享。先对 q4_K / q5_K / q6_K / iq4_XS 做了，随后复测把范围收敛到 **q4_K 和 q5_K**：q6_K 的权重侧只有一次 `dp4a`，外提反而慢约 1%；iq4_XS 连激活侧一起外提会多占寄存器，慢 6%。两条负收益路径都已回退。`ncols_dst == 1`（非投机）仍走原代码路径
+- **Turing 每 block 处理 4 行**：参数表原本在 2~4 列时用 2 rows/block，导致权重矩阵的突发读取不够长——q4_K 在 n=3 时只有 381 GB/s，而单列能跑到 469 GB/s。改为 4 rows/block 后各档全面提升（q4_K +14%/+21%、iq4_XS +15%/+24%、q5_K +9%/+15%、iq3_S +12%、q6_K +5%/+13%）；再往上试 8 rows 又变慢，所以停在 4
+- kernel 层 q4_K（m=4096, k=14336）：n=3 `87.2 -> 74.9 us`，n=4 `107.4 -> 84.7 us`
+- 端到端：**Q4_K_M +5.9%、IQ3_S +11.6%、Q4_K_XL +4.6%**
+- `test-backend-ops` MUL_MAT 1132/1134，2 个失败是既有的 `iq1_m`（那些 shape 不走 MMVQ）
+
+> 复测注意：显存空闲时会掉到 810 MHz，单次对比的读数没有意义。要么锁显存频率，要么让 GPU 除基准外完全空闲。
+
+### 9. 移植的上游正确性修复
+以下几条**不是提速**，是修复会在长会话里咬人的缺陷：
+
+- `ggml-cuda`：正在使用的计算图不再被 eviction sweep 淘汰（上游 `00f113ec`）
+- `speculative`：补上 MTP hidden state 的 get/set，slot 存取档时草稿状态才能正确恢复（`0f35d6d7`）
+- `server`：按 draft 长度而不是 rollback size 选 spec checkpoint（`7df8b876`）
+- `delta-net`：conv 回滚槽改为一次 `set_rows` 写入，替代 K 次独立拷贝（`040ce199`）
+- `ggml`：去掉基于 shape 的 view 边界断言，它会误拒合法的 strided view
+
+移植前后输出与 draft 接受率完全一致（锁 1500 MHz：34.52 vs 34.53 t/s）。
+
+### 10. 代码审计修复
+- **top-k**：修正 CUDA 侧的派发；`GGML_CUDA_USE_CUB` 路径同样上报宽行 top-k 支持，并在 `ggml_cuda_top_k_supported` 拒绝非 f32 / 非连续输入
+- **DFlash2 不等长 draft block**：批次折叠成 `[tokens_per_block, n_seqs]` 时，多个槽因剩余上下文不同而要求不同 `n_max`，批次会被切成 block 边界错乱的 ubatch，**草稿质量静默劣化**。现按所有 drafting 序列夹紧 block 长度。单草稿槽不受影响，MTP 不用 block 折叠
+- `nextn` 层的 reserve、`fit` 的 MTP 层计数、Win7 下的文件写入路径各修一处
+- `conversion`：GGUF 缺 `head_dim` 时回退用 `hidden_size / n_head`
+- 回归：`test-backend-ops` TOP_K 375/375、ARGSORT 46/46、SET_ROWS 通过；2~3 槽 DFlash2 混合 `max_tokens`（含 1492 token 长 prompt）跑干净
+
+## 性能实测
+
+机器：RTX 2080 Ti 22G / i5-14400F / Win7 / CUDA 11.4。
+口径：`llama-server`，`-c 8192 -ngl 99 -fa on --parallel 1 -b 2048 -ub 512 --no-mmap --jinja --temp 0`，取 `/v1/chat/completions` 的 `timings.predicted_per_second`，默认 boost，单次运行，**噪声约 ±5%**。
+
+### 投机解码各配置（Qwen3.8-27B Q4_K_M，t/s）
+
+| 配置 | 散文 | 代码（128 tok） | 代码（256 tok） |
+|------|-----:|-----:|-----:|
+| 内置 MTP `n=2` | 34.5 | 44.8 | 42.8 |
+| FastMTP 模块 `n=2` | 37.1 | 50.0 | 42.3 |
+| **FastMTP + ngram-mod `n=2`** | **37.3** | **75.1** | **50.0** |
+
+- `--spec-type` 支持逗号分隔叠加，多个 speculator 按优先级串联，ngram 系优先于 MTP
+- ngram 对**代码 / 结构化输出**收益最大（+18% ~ +50%，相对内置 MTP 最高 +72%），因为重复片段只需一次哈希查找就能命中；**散文持平**
+- FastMTP 模块本身散文 +7% ~ +12%，长代码输出在噪声内持平
+- `n=3` 只在纯内置 MTP 下略有优势，叠加 ngram 后更差
+- 生产配置（`-c 110592` + KV q8_0 + FastMTP + `draft-mtp,ngram-mod`）稳定在 **44 t/s 左右**，比只用内置 MTP 的 33 t/s 高约 33%
+
+### 上下文长度不惩罚解码
+
+同一配置，`-c 32768` 填约 13k token 对比 `-c 8192` 空上下文：**37.5 vs 37.1 t/s**。该混合模型 64 层里有 48 层是 GDN 线性注意力，其循环状态不随长度变贵，所以 13k 以内不必为速度砍上下文。32k 以上才变贵（全注意力那 16 层的 KV 读写随长度线性增长）。
+
+显存吃紧时优先降 KV 精度（`-ctk q8_0 -ctv q8_0`，代价 0~3%），而不是降上下文。
+
+### 量化的性价比
+
+同一 27B 模型五个量化文件，`llama-bench -p 512 -n 128` 下的每 GiB 解码成本（2026-11-08 测量）：
+
+| 文件 | GiB | tg128 t/s | ms/GiB |
+|------|----:|----:|----:|
+| IQ3_XXS | 9.72 | 18.0 | 5.71 |
+| IQ3_S | 10.95 | 19.3 | 4.73 |
+| IQ4_XS | 13.26 | 20.3 | 3.72 |
+| **Q4_K_M** | **15.32** | **20.5** | **3.19** |
+| Q4_K_XL | 16.68 | 19.0 | 3.15 |
+
+- 曲线在 4.2~4.8 bpw 见底，**Q4_K_M 是默认选择**：再往低比特走，省下的字节会被 i-quant 的反量化 ALU 成本吃掉
+- IQ4_XS 只在显存不够开长上下文时才换：省 2.1 GiB，解码慢约 1%
+- IQ3_S 这类 i-quant 为主的模型（IQ3_S 30% + IQ4_XS 25% + IQ3_XXS 17%）**吃不到**第 8 节的权重外提优化，那些类型仍走原路径；但能吃到 4 rows/block 的 +11.6%
+
+### 为什么到不了 50 t/s
+
+不是「代码不够新」。拆开看：MTP 每步 59.1 ms、每步平均产出 2.35 token，即 37 t/s。要 50 t/s 需要每步 ≤ 47 ms，只有两条路：
+
+1. 单 token 从 43 ms 压到 33 ms，对应有效带宽 329 -> 470 GB/s（约等于 MMVQ 单内核实测的 469 GB/s）
+2. draft 接受率从 57% 提到 85%，每步 3.85 token
+
+根因之一是 **IQ4_XS 在 Turing 上是算力/反量化受限，不是纯带宽受限**：把 SM 锁到 1500 MHz，解码从 23.1 掉到 17.0 t/s（-26%），而显存频率没动。纯带宽受限的负载不该对 SM 频率这么敏感。
 
 ## 编译
 
@@ -148,6 +270,13 @@ llama.dll       llama-common.dll   llama-server-impl.dll   mtmd.dll
 
 必须**整套替换**，不要只替换 `ggml-cuda.dll`：各 DLL 之间存在 ABI 依赖。
 
+### 其他构建脚本与补丁
+
+| 文件 | 作用与注意事项 |
+|------|------|
+| `configure_patched.bat`<br>`build_patched.bat` | 单架构（sm_75）构建，输出到 `build-win7-cuda114-v142-patched`，日志写到构建脚本同级目录的 `build_patched.log`。脚本里的 `D:/llama_win7_cuda/...` 和 `C:/BuildTools2019/...` 是**硬编码**的，用前需改成自己的路径 |
+| `HauhauCS-FastMTP-llama.cpp.patch` | FastMTP 草稿模块所需的 `d2t` draft-vocab trim。**当前源码树已经包含这些改动，直接构建即可，不要 `git apply`**（现在 apply 会报 `patch does not apply`）。保留此文件是为了同步上游后能重新套用 |
+
 ## 已修复的 Bug
 
 | # | 症状 | 根因 | 修复 |
@@ -158,12 +287,41 @@ llama.dll       llama-common.dll   llama-server-impl.dll   mtmd.dll
 | 4 | Win7 上 `GetFileInformationByHandleEx` 导入失败 | `std::filesystem` 间接引入 Win8+ API | Win32 API 替代 |
 | 5 | cpp-httplib `WSAPoll` 在 Win7 上不可用 | HTTP 库使用了 Win8+ 网络 API | `select()` 回退 |
 | 6 | 多模态模型（如 Qwen3-ASR）无法识别音频，只输出 `language None<asr_text>` | cuBLAS 对 f16 权重使用 `CUBLAS_COMPUTE_16F`（fp16 累加），本工具链下普通 `ggml_mul_mat` 产出 `inf`；而 mmproj 的卷积 / `conv_out` 权重正是 f16，导致音频嵌入变成垃圾。量化权重走另一条路径，所以纯文本推理看起来正常 | `ggml-cuda.cu`：当 `src0->type == GGML_TYPE_F16` 时改走既有 `prefer_f32_output` 分支，用 f32 累加。量化权重不受影响，LLM 推理速度不变。修复后 `test-backend-ops` 的 CUDA 失败数由 201 降到 4（剩余为 `iq1_m`，另一独立问题） |
+| 7 | 以 `w` / `a` 模式打开的文件写不出内容 | `llama_file::impl` 用 `CreateFileW` 拿到 HANDLE 后，`_open_osfhandle` 固定传 flags `0`，CRT 侧始终是只读句柄，`fwrite` 不生效 | 按 fopen 模式映射 `_O_WRONLY` / `_O_APPEND`，并让 CRT fd 接管 HANDLE 的生命周期，避免重复 `CloseHandle` |
+| 8 | 多草稿槽并发时 DFlash2 提案质量静默下降（不报错，只影响加速比） | 各槽剩余上下文不同导致 `n_max` 不一致，折叠成 `[tokens_per_block, n_seqs]` 的批次被切成 block 边界错乱的 ubatch | 跨所有 drafting 序列夹紧 draft block 长度；单草稿槽与 MTP 不受影响 |
+| 9 | 宽行 top-k 在 CUDA 上不可用，或结果不对 | top-k 的能力判断没覆盖 `GGML_CUDA_USE_CUB` 路径，也没校验输入的 dtype 与内存连续性 | 该路径同样上报支持；非 f32 或非连续输入直接判为不支持。`test-backend-ops` TOP_K 375/375 |
+| 10 | 挂了 `-md` 草稿模型后，显存比预期多约 330 MiB | `load_mtp` 只由 `--spec-type` 决定，完全忽略 `-md`。此时 drafting 在 `ctx_dft` 里跑，目标模型的 nextn 层永不执行却常驻权重 | `load_mtp` 加上 `!has_dft()` 条件，并对 draft 上下文强制开启。输出逐字节不变 |
+
+## 已知风险与未解决问题
+
+### 长生成时黑屏（TDR）：生产机上仍未定论
+
+- **现象**：长时间生成时突然黑屏 -> 显示恢复 -> WER 弹窗提示 `llama-server` -> 进程残留需手杀。
+- **判读**：典型的 TDR（`TdrDelay` 默认 2 秒）。kernel 超时被驱动杀掉，CUDA context 随即失效触发 `GGML_ABORT`，再撞上 WER 弹窗把进程挂住。
+- **能缩短链条的配置**：`TdrDelay=60`，关闭 WER 弹窗，用 `/health` 看门狗自动重启残留进程。
+- **头号嫌疑**：`82e4764` 那 3 行多列 MMVQ（投机验证批正好落在 2~4 列）。回退它是最稳的选择，**代价是解码 -13%**（本机 A/B：44.91 -> 39.13 t/s）。
+- **但本机复现不了**：Win7 双启后，同一版二进制 10 轮草稿式长生成全部通过（40~48 t/s，`draft_n` 约 1800~2000），关 VMM、关投机也都正常。
+- **余下差异指向环境**：该配置下显存只剩约 0.75 GB（21771/22528 MiB），而出问题的机器同时装着云桌面客户端。最省事的验证方向是把上下文降一档（`-c 110592` 降到 `-c 65536`）再压三轮：若不再黑屏，说明是显存余量问题，那 13% 就得让出去。
+
+### 其他遗留
+
+- `iq1_m` 在 `test-backend-ops` 里有 2 个 MUL_MAT 用例失败，属独立遗留问题，本分支未处理，也不是 MMVQ 改动引入的。
+- 曾被怀疑但已排除的方向：`--spec-draft-p-min` 剪枝（五档草稿数完全相同，无效）、换回内置 MTP 提高接受率（慢 9%）、iq4_XS 权重外提（端到端 -0.75%，已回退）、q4_K 尾部越界读（该模型所有 q4_K 张量行数都是 4 的倍数）。
+
+## 辅助工具
+
+| 脚本 | 用途 |
+|------|------|
+| `dump_gguf_meta.py <file.gguf>` | 打印 GGUF 头（version / n_tensors / n_kv）、全部 KV 与张量表。用来确认 MTP / `d2t` 张量在不在、量化档位对不对 |
+| `read_gguf_meta.py` | 同上的早期一次性版本，**模型路径硬编码在脚本里**，日常用 `dump_gguf_meta.py` |
 
 ## 免责声明
 
 - 本项目仅在自己的测试环境（Win7 x64 + 2080 Ti 22GB + CUDA 11.4）验证通过
 - **未在其他 GPU、驱动版本、模型上测试**
 - 多架构构建中的 sm_61 / sm_86 等架构仅验证了**编译产物正确包含对应 cubin**，未在对应显卡上做过运行时验证
+- 所有 t/s 都是默认 boost 下单次运行的采样，噪声约 ±5%；跨机器、跨驱动的差异可能大于这些数字之间的差距。涉及显存带宽的对比必须锁频，否则空闲显存会掉到 810 MHz，读数没有意义
+- 长生成 TDR 黑屏在部分机器上仍未定论，见[已知风险与未解决问题](#已知风险与未解决问题)
 - 可能存在未发现的兼容性问题，生产环境使用请自行评估风险
 - 欢迎提交 Issue 反馈其他环境下的问题
 
